@@ -1,0 +1,522 @@
+---
+title: "caret demostration with kaggle bikeshare data (I)"
+output: html_document
+---
+
+### Purpose
+  
+  - This is a demostration to solve regression problem with some (popular?) models in *caret*.
+  - The data is from the kaggle: bicycle sharing competition. The features of data are quite clean, straightforward, and complete. No need to do much data cleanning, so that we can focus on comparing the models. 
+  - Included models: tree-based models (*ctree*, *rpart*), boosting models (*gbm*, *gamboost*), bagged models (*treebag*, *bagEarth*), random forest (*rf*, *cforest*, *qrf*), linear regression models (*enet*, *pcr*, *glmnet*), Radial-kernal regression (*rvmRadial*), and neural network (*nnet*, *pcaNNet*, *neuralnet*).  
+  - The list is by no means complete. For each model, I only try a grid of simple/convenient parameters. The purpose is to taste a's many models as I could, and I am not intended to do a serious benchmark comparisons between models. 
+ 
+```{r,echo=FALSE,warning=FALSE,message=FALSE}
+setwd('~/workspace/kaggle_bikesharing/Tutorial')
+library(party)
+library(rpart)
+library(pROC)
+library(caret)
+library(mboost)
+library(ipred)
+library(earth)
+library(gbm)
+library(plyr)
+library(randomForest)
+library(Metrics)
+require(doMC)
+registerDoMC(cores=4)
+source('mymetric.R')
+source('tools.R')
+```
+
+### Data  
+
+```{r, echo=FALSE,cache=TRUE,message=FALSE}
+#read in train/test
+test_classes = c(
+"character", # datetime
+"factor", # season
+"factor", # holiday
+"factor", # workingday
+"factor", # weather
+"numeric", # temp
+"numeric", # atemp
+"integer", # humidity
+"numeric", # windspeed
+"numeric", #registered
+"integer" #count
+)
+set_up_features <- function(df) {
+  df$datetime <- strptime(df$datetime, format="%Y-%m-%d %H:%M:%S")
+  df$hour <- as.factor(df$datetime$hour)
+  df$wday <- as.factor(df$datetime$wday)
+  df$month <- as.factor(df$datetime$mon)
+  df$year <- as.factor(df$datetime$year + 1900)
+df
+}
+```
+
+  - data loading 
+  - split the datetime to hour, month, year, and wday using strptime
+  - calculate log(count+1) to replace count, which will be used for prediction.
+      Advantage: 
+        1. the evalutation RMSLE metrics will be transofrmed to RMSE, one of the default metrics in *caret::train*. 
+        2. The prediction of regression won't be negative. 
+  - removing the unnecesary features
+        1. casual, register: Useless -- not appear in the test set.
+        2. datetime, count: Redaudant -- replaced by new features
+  
+```{r,cache=TRUE,message=FALSE}
+train <- read.csv("../DATA/train.csv", colClasses=test_classes)
+test <- read.csv("../DATA/test.csv", colClasses=test_classes[1:9])
+train$count <- as.integer(train$count)
+
+train_factor <- set_up_features(train)
+test_factor <- set_up_features(test)
+
+train_factor$lgcount <- log(train_factor$count+1)
+train_factor<- train_factor[,-12]
+train_factor<- train_factor[,-11]
+train_factor<- train_factor[,-10]
+train_factor<- train_factor[,-1]
+test_factor<- test_factor[,-1]
+```
+
+### Sample split and CV optimization -- use *caret*
+
+Split the sample into 20% testing subsample and 80% trainning subsample.
+
+```{r,cache=TRUE,message=FALSE}
+set.seed(212312)
+trainIndex <- createDataPartition(train_factor$lgcount, p = 0.8, list=FALSE, times=1)
+subTrain <- train_factor[trainIndex,]
+subTest <- train_factor[-trainIndex,]
+```
+
+### A simple tree model
+
+  - a simple test using Conditional Inference Tree (*party::ctree*)
+  - Use the entire dataset with no sample splitting 
+
+```{r, cache=TRUE,message=FALSE}
+library(party)
+#create our formula
+formula <- lgcount ~ season + holiday + workingday + weather + temp + atemp + humidity + windspeed + hour + wday + month + year
+#build our model
+fit.ctree.party <- ctree(formula, data=subTrain,controls=ctree_control(mincriterion=0.95,savesplitstats=FALSE))
+```
+```{r, echo=FALSE,warning=FALSE}
+if(!exists('fit.ctree.party')){
+  load(file='fit_ctree_plain.RData')
+}
+tool.performance(fit.ctree.party,subTest,subTrain,check.lgcount=TRUE,check.update=FALSE)
+print(paste('object.size: ',format(object.size(fit.ctree.party), units='auto')),quote=FALSE)
+rm(fit.ctree, fit.ctree.party)
+```
+
+-- The RMSLE of left-out testing subsample is 0.418. Not bad, actually. 
+-- The tree is quite large (~46MBs), and I don't know how to examine the result easily. Let's try *caret* instead. 
+  
+  
+
+### Modeling with *caret*
+
+#### Try to reproduce the *party::ctree* result with trainning subsample 
+  
+```{r,cache=TRUE,eval=FALSE,warning=FALSE}
+# all features 
+formula <- lgcount ~ season + holiday + workingday + weather + temp + atemp + humidity + windspeed + hour + wday + month + year
+fit.ctree <- train(formula, data=subTrain,method='ctree',tuneGrid=expand.grid(mincriterion=0.95))
+ctreeVarImp = varImp(fit.ctree)
+```
+```{r, echo=FALSE,warning=FALSE}
+if(!exists('fit.ctree')){
+  load(file='fit_ctree_plain.RData')
+} else {
+  save(fit.ctree.party,fit.ctree, file='fit_ctree_plain.RData')
+}
+tool.performance(fit.ctree,subTest,subTrain,name='ctree.caret.plain',check.lgcount=TRUE,check.update=FALSE)
+print(paste('object.size: ',format(object.size(fit.ctree), units='auto')),quote=FALSE)
+predict.ctree <- exp(predict(fit.ctree, subTrain))-1
+predict.ctree.party <- exp(as.vector(predict(fit.ctree.party, subTrain)))-1
+data<-rbind(data.frame(count = exp(subTrain$lgcount)-1, predict=predict.ctree, model='caret::ctree'),
+      data.frame(count = exp(subTrain$lgcount)-1, predict=predict.ctree.party, model='party::ctree'))
+ plot(data$count, data$predict, col=data$model, xlab='count', ylab='pred',pch='.')
+ plot(varImp(fit.ctree),main='features importance')
+rm(fit.ctree, fit.ctree.party, data)
+```
+
+  - Quite disappointing. The difference between the rmsle of testing subsample (0.54) and the training subsample (~0.50) is large. There may be serious outfitting problem. 
+  - But, the most serious problem is apparently the *ctree* using *caret* is different from using it directly in *party*. The default parameters must be different. I have tried to force the mincriterion=0.95 (the tunning parameter of *caret/ctree*) for both models, but it doesn't work. 
+  - I didn't find a way to tune other *ctree* parameters, like maxdepth, in *caret/ctree*. 
+  - Apparently, there are many things I don't know to use the two *ctree* models. But, let's move on to try other models. 
+
+#### Model1: Try *ctree2* with 6-fold CV optimization with *caret*
+
+    -- here I use ctree2, since the parameter (maxdepth) is easier to understand.
+  
+    -- use RMSE to select the best model 
+  
+```{r,cache=TRUE,eval=FALSE}
+  ##ctree2 with CV
+  fitControl <- trainControl(method = 'cv', number=6,summaryFunction=defaultSummary)
+  set.seed(123)
+  Grid <- expand.grid(maxdepth = seq(15, 50,5))
+  formula <- lgcount ~ season + holiday + workingday + weather + temp + atemp + humidity + windspeed + hour + wday + month + year
+  fit.ctree2CV <- train(formula, data=subTrain, method = 'ctree2', trControl=fitControl,tuneGrid=Grid,metric='RMSE')
+```
+
+```{r, echo=FALSE,warning=FALSE,cache=TRUE}
+if(!exists('fit.ctree2CV')){
+  load(file='fit_ctree2CV.RData')
+} else {
+  save(fit.ctree2CV, file='fit_ctree2CV.RData')  
+}
+plot(fit.ctree2CV)
+tool.performance(fit.ctree2CV,subTest,subTrain,name='ctree2.CV', check.lgcount=TRUE,check.update=FALSE)
+print(paste('object.size: ',format(object.size(fit.ctree2CV), units='auto')),quote=FALSE)
+plot(varImp(fit.ctree2CV),main='features importance')
+rm(fit.ctree2CV)
+```
+
+
+  - The rmsle of the testing set becomes 0.51, and that of the trainning set is 0.43. Both are improved. The overfitting is even more serious, though. However, I still can't reach the result using *party::ctree* (default parameters). :(    
+  - hour is the most important feature. But, surprisingly, the feature of wday, workingday, and holiday are all quite useless. Temperature seems to outweight than the other weather factor, e.g. windspeed and humidity. 
+
+#### Model2: Try *caret::rpart* with 6-fold CV optimization
+
+  - try another tree-like model: CART using *caret::rpart* 
+
+```{r,eval=FALSE}
+##model2a: CART using rpart with CV
+set.seed(123)
+fitControl <- trainControl(method = 'cv', number=6)
+Grid <- expand.grid(cp=seq(0, 0.05, 0.005))
+formula <- lgcount ~ season + holiday + workingday + weather + temp + atemp + humidity + windspeed + hour + wday + month + year
+fit.rpartCV <- train(formula, data=subTrain, method = 'rpart', trControl=fitControl, metric='RMSE',maximize=FALSE, tuneGrid = Grid)
+##model2b: rpart2 with CV
+set.seed(123)
+formula <- lgcount ~ season + holiday + workingday + weather + temp + atemp + humidity + windspeed + hour + wday + month + year
+fitControl <- trainControl(method = 'cv', number=6)
+Grid<-expand.grid(.maxdepth=seq(5,20,5))
+fit.rpart2CV <- train(formula, data=subTrain, method = 'rpart2', trControl=fitControl, metric = 'RMSE', maximize=FALSE, tuneGrid=Grid)
+plot(fit.rpartCV)
+plot(fit.rpart2CV)
+```
+
+```{r, echo=FALSE,warning=FALSE,cache=TRUE}
+if(!exists('fit.rpart2CV')){
+  load(file='fit_rpart.RData')
+} else {
+  save(fit.rpartCV, fit.rpart2CV, file='fit_rpart.RData')
+}
+plot(fit.rpartCV,main='caret::rpart 6-fold CV')
+plot(fit.rpart2CV,main='caret::rpart2 6-fold CV')
+printres = data.frame()
+printres<- tool.performance(fit.rpartCV,subTest,subTrain,name='rpart.CV', compare=printres, check.lgcount=TRUE)
+printres<- tool.performance(fit.rpart2CV,subTest,subTrain,name='rpart2.CV', compare=printres, check.lgcount=TRUE)
+show(printres)
+print(paste('rpart.CV size: ',format(object.size(fit.rpartCV), units='auto')),quote=FALSE)
+print(paste('rpart2.CV size: ',format(object.size(fit.rpart2CV), units='auto')),quote=FALSE)
+plot(varImp(fit.rpartCV),main='features importance (rpart)')
+rm(fit.rpartCV,fit.rpart2CV)
+```
+
+    - Ok. The performance is not better than *caret::ctree*. Especially, *rpart2* seems to stop improving at $maxdepth=10$. The rmsle is fixed to around 0.78 for the training set, which is almost the same for the testing set. The *rpart* model, on the other hand, converges to non-contrained model with $cp=0$. The RMSLE of the Training subsample is much smaller than the Testing subsample, which means overfitting.     
+    - The models will treat the factorized features with more than two levels as multiple variables. The feature importance plot looks much more complex. 
+    - However, the physical size of the models are much smaller than those from *ctree*.   
+
+### Esemble model: boosting / bagging / random forest
+
+#### Model 3a: stocasting gradient boosting (*gbm*, 6-fold CV)
+
+```{r,eval=FALSE}
+## gbm fitting
+set.seed(123)
+fitControl <- trainControl(method = 'cv', number = 6, summaryFunction=defaultSummary)
+Grid <- expand.grid( n.trees = seq(50,1000,50), interaction.depth = c(30), shrinkage = c(0.1))
+formula <- lgcount ~ season + holiday + workingday + weather + temp + atemp + humidity + windspeed + hour + wday + month + year
+fit.gbm <- train(formula, data=subTrain, method = 'gbm', trControl=fitControl,tuneGrid=Grid,metric='RMSE',maximize=FALSE)
+plot(fit.gbm)
+plot(gbmVarImp)
+```
+
+```{r, echo=FALSE,warning=FALSE}
+if(!exists('fit.gbm')){
+  load(file='fit_gbm_v1.RData')
+} else {
+  save(fit.gbm, file='fit_gbm_v1.RData')  
+}
+plot(fit.gbm)
+tool.performance(fit.gbm,subTest,subTrain,name='gbm.CV', check.lgcount=TRUE,check.update=FALSE)
+print(paste('object.size: ',format(object.size(fit.gbm), units='auto')),quote=FALSE)
+plot(varImp(fit.gbm),main='features importance')
+rm(fit.gbm)
+```
+
+    - The result seems to be very good.     
+    - The model is optimized at $n.tree=650$ for shrinkage=0.1 and interaction=30. I will explore more on the parameter space later. Smaller shrinkage may reduce the risk of overfitting.    
+    - The feature of hour is even more distinguished with this model. Also, *gbm*, like *rpart*, will treat multi-level features are multiple variables. I need to consider whether this is good or not. In this way, features like **hour** may be splitted into too many parameters which increase the complexity of models. On the other hand, we know the response of **hour** won't be linear, which means we may not gain to use a single **hour** feature for naive linear regression. 
+
+
+#### Model 3b: Another boosting model - *gamboost* in *caret*
+
+The model is from *mboost*. It is another realization of gradient bossting model with parameter **mstop**, the number of initial boosting iterations, and **prune**, which is not found in the original *mboost* guide. 
+
+  Note: 
+    1. **prune** seems to be not tunnable using tuneGrid. It will be held constant at the first number of the sequence. 
+    2. It also doesn't change the result. I have tried $prune = 0.1, 0.5, 0.9, 5$. It all gives the same result at $mstop=300$. 
+
+```{r,eval=FALSE}
+## gamboost fitting
+set.seed(123)
+fitControl <- trainControl(method = 'cv', number=6, summaryFunction=defaultSummary)
+Grid <- expand.grid(.mstop=seq(100,1000,100),.prune=c(5))
+formula <- lgcount ~ season + holiday + workingday + weather + temp + atemp + humidity + windspeed + hour + wday + month + year
+fit.gamboost <- train(formula, data=subTrain, method = 'gamboost', trControl=fitControl,tuneGrid=Grid,metric='RMSE',maximize=FALSE)
+```
+
+```{r, echo=FALSE,warning=FALSE}
+if(!exists('fit.gamboost')){
+  load(file='fit_gamboost_v1.RData')
+} else {
+  save(fit.gamboost, file='fit_gamboost_v1.RData')  
+}
+plot(fit.gamboost)
+tool.performance(fit.gamboost,subTest,subTrain,name='gamboost.CV', check.lgcount=TRUE,check.update=FALSE)
+print(paste('object.size: ',format(object.size(fit.gamboost), units='auto')),quote=FALSE)
+plot(varImp(fit.gamboost),main='features importance')
+rm(fit.gamboost)
+```
+
+  - The RMSLE is worse than the model of *caret::gbm*. But, there shows no sign of overfitting.  
+  - I suppose there should be some way to allow **prune** to vary, or there should be a parameter similar to **shrinkage** in *gbm*. Well, I don't want to spend too much time on this, and move on to the next model. 
+
+#### Model 4a: bagged CART - *treebag* in *caret*
+
+  - The model is from *ipred*. In *caret*, it is simple, and no grid parameter to tune.   
+    
+```{r,eval=FALSE}
+## treebag fitting
+set.seed(123)
+fitControl <- trainControl(method = 'none', summaryFunction=defaultSummary)
+formula <- lgcount ~ season + holiday + workingday + weather + temp + atemp + humidity + windspeed + hour + wday + month + year
+fit.treebag <- train(formula, data=subTrain, method = 'treebag', trControl=fitControl)
+show(fit.treebag)
+save(fit.treebag,file='fit_treebag_v1.RData')
+```
+```{r, echo=FALSE,warning=FALSE}
+if(!exists('fit.treebag')){
+  load(file='fit_treebag_v1.RData')
+} else {
+  save(fit.treebag, file='fit_treebag_v1.RData')  
+}
+tool.performance(fit.treebag,subTest,subTrain,name='treebag.CV', check.lgcount=TRUE,check.update=FALSE)
+print(paste('object.size: ',format(object.size(fit.treebag), units='auto')),quote=FALSE)
+plot(varImp(fit.treebag),main='features importance')
+rm(fit.treebag)
+```
+
+  - Ok. Not surprisingly, the performance is worse than the boosted models. 
+  - I suppose this is based on *rpart* models, so that the multi-level features will be splitted. In addition, the result is not storage-friendly, and the calculation is quite slow.  
+
+#### Model 4b: bagged MARS - bagEarth in caret/earth
+
+According to the *caret* guide, *bagEarth* is ``A bagging wrapper for multivariate adaptive regression splines (MARS) via the earth function''. 
+
+```{r,eval=FALSE}
+## bagEarth fitting
+set.seed(123)
+fitControl <- trainControl(method = 'cv', number = 6, summaryFunction=defaultSummary)
+Grid <- expand.grid(degree=c(2), nprune = seq(10,90,20))
+formula <- lgcount ~ season + holiday + workingday + weather + temp + atemp + humidity + windspeed + hour + wday + month + year
+fit.bagEarth <- train(formula, data=subTrain, method = 'bagEarth', trControl=fitControl,tuneGrid=Grid,metric='RMSE',maximize=FALSE,keepX=FALSE)
+#show(fit.bagEarth)
+```
+
+  - There is also similar problem with *caret::treebag*, the tunning parameters aren't under my control. **degree** seems to be held at the first value I feed in.
+  - Another problem is the result is unnecessarily large (>300MBs), and very time consuming to run. It is even slower than random forest.   
+  
+```{r, echo=FALSE,warning=FALSE}
+if(!exists('fit.bagEarth')){
+  load(file='fit_bagEarth_v1.RData')
+} else {
+  save(fit.bagEarth, file='fit_bagEarth_v1.RData')  
+}
+plot(fit.bagEarth)
+tool.performance(fit.bagEarth,subTest,subTrain,name='bagEarth.CV', check.lgcount=TRUE,check.update=FALSE)
+print(paste('object.size: ',format(object.size(fit.bagEarth), units='auto')),quote=FALSE)
+plot(varImp(fit.bagEarth),main='features importance')
+rm(fit.bagEarth)
+```
+  - The RMSLE is ok ~ 0.42 for Testing subsample with $degree=2$. It seems to be not overfitting. 
+
+#### Model 5: random forest (*rf*, oob)
+
+```{r,cache=TRUE,eval=FALSE}
+# random forest
+set.seed(123)
+tc <- trainControl("oob")
+Grid <- expand.grid(mtry = seq(4,16,4))
+formula <- lgcount ~ season + holiday + workingday + weather + temp + atemp + humidity + windspeed + hour + wday + month + year
+fit.rf <- train(formula, data=subTrain , method='rf', trControl=tc,tuneGrid=Grid,metric='RMSE')
+```
+
+```{r, echo=FALSE,warning=FALSE}
+if(!exists('fit.rf')){
+  load(file='fit_rf_v1.RData')
+} else {
+  save(fit.rf, file='fit_rf_v1.RData')  
+}
+plot(fit.rf$results$mtry, fit.rf$results$RMSE, xlab='mtry', ylab='RMSE oob')
+show(fit.rf$results)
+tool.performance(fit.rf,subTest,subTrain,name='rf.oob', check.lgcount=TRUE,check.update=FALSE)
+print(paste('object.size: ',format(object.size(fit.rf), units='auto')),quote=FALSE)
+rm(fit.rf)
+```
+
+  - Disappointing, random forest behave worse than other models. In addition, there seems to be some overfitting. The mode is optimized at mtry=16. 
+  - Could it be due to the difference of oob and 4-fold CV? 
+  
+  - The model is optimized at mtry = 8. n
+ 
+#### Model 5b: try random forest with 4-fold CV
+```{r,cache=TRUE,eval=FALSE}
+# random forest
+set.seed(123)
+tc <- trainControl("cv",number=4)
+Grid <- expand.grid(mtry = seq(4,16,4))
+formula <- lgcount ~ season + holiday + workingday + weather + temp + atemp + humidity + windspeed + hour + wday + month + year
+fit.rf.cv <- train(formula, data=subTrain , method='rf', trControl=tc,tuneGrid=Grid,metric='RMSE')
+```
+
+```{r, echo=FALSE,warning=FALSE}
+if(!exists('fit.rf.cv')){
+  load(file='fit_rf_cv_v1.RData')
+  load(file='fit_rf_v1.RData')
+} else {
+  save(fit.rf.cv, file='fit_rf_cv_v1.RData')  
+}
+plot(fit.rf$results$mtry, fit.rf$results$RMSE, xlab='mtry', ylab='RMSE',col='blue')
+points(fit.rf.cv$results$mtry, fit.rf.cv$results$RMSE,col='red')
+legend('topright', c('rf.oob','rf.cv'), col=c('blue','red'),pch=1)
+show(fit.rf.cv$results)
+printres = data.frame()
+printres <- tool.performance(fit.rf.cv,subTest,subTrain,name.='rf.cv', compare.=printres, check.lgcount=TRUE)
+printres <- tool.performance(fit.rf,subTest,subTrain,name.='rf.oob', compare.=printres, check.lgcount=TRUE)
+show(printres)
+rm(fit.rf,fit.rf.cv)
+```
+
+  - All right. No surprise. They are similar. 
+
+### A quick table of all model performances
+
+```{r, echo=FALSE}
+  load(file='fit_ctree_plain.RData')
+  compare <- data.frame()
+  compare<-tool.performance(fit.ctree.party,subTest,subTrain,'ctree.party',compare,check.lgcount=TRUE)
+  compare<-tool.performance(fit.ctree,subTest,subTrain,'ctree',compare,check.lgcount=TRUE)
+  rm(fit.ctree.party,fit.ctree)
+
+  load(file='fit_ctree2CV.RData')
+  compare<-tool.performance(fit.ctree2CV,subTest,subTrain,'ctree2.CV',compare,check.lgcount=TRUE)
+  rm(fit.ctree2CV)
+
+  load(file='fit_rpart.RData')
+  compare<-tool.performance(fit.rpartCV,subTest,subTrain,'rpart.CV',compare,check.lgcount=TRUE)
+  compare<-tool.performance(fit.rpart2CV,subTest,subTrain,'rpart2.CV',compare,check.lgcount=TRUE)
+  rm(fit.rpart2CV,fit.rpartCV)
+
+  load(file='fit_gbm_v1.RData')
+  compare<-tool.performance(fit.gbm,subTest,subTrain,'gbm.CV',compare,check.lgcount=TRUE)
+  rm(fit.gbm)
+  load(file='fit_gamboost_v1.RData')
+  compare<-tool.performance(fit.gamboost,subTest,subTrain,'gamboost.CV',compare,check.lgcount=TRUE)
+  rm(fit.gamboost)
+  load(file='fit_treebag_v1.RData')
+  compare<-tool.performance(fit.treebag,subTest,subTrain,'treebag',compare,check.lgcount=TRUE)
+  rm(fit.treebag)
+  load(file='fit_bagEarth_v1.RData')
+  compare<-tool.performance(fit.bagEarth,subTest,subTrain,'bagEarth.CV',compare,check.lgcount=TRUE)
+  rm(fit.bagEarth)
+  load(file='fit_rf.v1.RData')
+  compare<-tool.performance(fit.rf,subTest,subTrain,'rf.oob',compare,check.lgcount=TRUE)
+  load(file='fit_rf_cv_v1.RData')
+  compare<-tool.performance(fit.rf.cv,subTest,subTrain,'rf.cv',compare,check.lgcount=TRUE)
+  rm(fit.rf,fit.rf.cv)
+```
+
+```{r}
+  show(compare)
+```
+
+### Submission of the Prediction
+
+  - Let's try submiting the predictions of gbm.cv, rf.cv, ctree.party, bagEarth.cv.  
+
+```{r, echo=FALSE, eval=FALSE}
+  load(file='fit_rf_cv_v1.RData')
+  load(file='fit_bagEarth_v1.RData')
+  load(file='fit_gbm_v1.RData')
+  load(file='fit_ctree_plain.RData')
+```
+```{r,eval=FALSE}
+#run model against test data set
+predict.rf <- predict(fit.rf.cv, test_factor)
+predict.rf <- exp(predict.rf) - 1 
+#build a dataframe with our results
+submit.rf <- data.frame(datetime = test$datetime, count=predict.rf)
+#write results to .csv for submission
+write.csv(submit.rf, file="submit_rf_v1.csv",row.names=FALSE,quote=FALSE)
+
+#run model against test data set
+predict.gbm <- predict(fit.gbm, test_factor)
+predict.gbm <- exp(predict.gbm) - 1 
+#build a dataframe with our results
+submit.gbm <- data.frame(datetime = test$datetime, count=predict.gbm)
+#write results to .csv for submission
+write.csv(submit.gbm, file="submit_gbm_v1.csv",row.names=FALSE,quote=FALSE)
+
+#bagEarth
+#run model against test data set
+predict.bagEarth <- predict(fit.bagEarth, test_factor)
+predict.bagEarth <- exp(predict.bagEarth) - 1 
+#build a dataframe with our results
+submit.bagEarth <- data.frame(datetime = test$datetime, count=predict.bagEarth)
+#write results to .csv for submission
+write.csv(submit.bagEarth, file="submit_bagEarth_v1.csv",row.names=FALSE,quote=FALSE)
+
+#ctree.party
+#run model against test data set
+predict.ctree <- predict(fit.ctree.party, test_factor)
+colnames(predict.ctree) = 'count'
+predict.ctree <- exp(predict.ctree) - 1 
+#build a dataframe with our results
+submit.ctree <- data.frame(datetime = test$datetime, count=predict.ctree)
+#write results to .csv for submission
+write.csv(submit.ctree, file="submit_ctree_v1.csv",row.names=FALSE,quote=FALSE)
+```
+
+Models       |  scores |Test.rmsle| 
+-------------|---------|----------|
+rf.cv        |  0.517  |0.469     |
+gbm.cv       |  0.402  |0.315     |
+bagEarth.cv  |  0.451  |0.424     |
+ctree.party  |  0.524  |0.34      |       
+
+  - Good news is **ctree.party** is the worst prediction. The effort is not in vain. However, I don't understand why my Testing.rmsle results are totally screw up.
+  - The best score is the **gbm.cv**, which ends at rank ~ 92/1823. Within top 5%, not bad for the first competition. 
+  - The strange thing is **rf** results bad. I probably did something stupid. I will fix it in the next run. 
+  
+### Summary
+
+  1. *caret* provides a nice integrated user interface of the large model set. I won't be able to try so many different models in these few days without *caret*. However, we may need to go back to the original package for further tunning, unless if there are some mysterious tricks I don't know.
+  2. Some models are tremendously storage-consuming, which may cause slow calculation. 
+  3. I need to consider more carefully, whether the parameters (especially multi-leveled parameters like hours) should be leveled or not.
+  4. Mysteriously, the RMSLE of my left-out testing subsample are **WAY OFF** the scores of kaggle. Should be fixed.
+  
+### To Be Continued ...
+
+  - I will use more random forest, linear regression, and radial-kernal regression in the next file: bikeshare-demand.2.Rmd.
+

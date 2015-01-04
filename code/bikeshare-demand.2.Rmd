@@ -1,0 +1,416 @@
+---
+title: "caret demo with kaggle bikeshare data (II)"
+output: html_document
+---
+
+```{r chunk1-libraryloading,echo=FALSE,cache=TRUE}
+setwd('~/workspace/kaggle_bikesharing/Tutorial')
+library(party)
+library(rpart)
+library(plyr)
+library(pROC)
+library(caret)
+library(Metrics)
+require(doMC)
+library(gbm)
+library(elasticnet)
+library(MASS)
+library(neuralnet)
+library(nnet)
+library(glmnet)
+library(pls)
+registerDoMC(cores=4)
+source('mymetric.R')
+source('tools.R')
+```
+
+## Problems to solve
+
+  -- I will use the correct statistical distribution (Poisson), if possible. GBM is able to choose the distribution function.
+  
+  -- I will use count instead of lgcount, and implement the rmsle as metric again. 
+    
+  -- feature of holiday is redaudant (covered by wday + workingday), so take it out. season is perhaps useless, too. 
+  
+  -- I should do more careful feature selections
+  
+  -- I will try to use more regression pacific algorithm + SVM + ... 
+  
+## Data
+```{r chunk2-dataformat, echo=FALSE,cache=TRUE}
+#read in train/test
+test_classes = c(
+"character", # datetime
+"numeric", # season
+"numeric", # holiday
+"numeric", # workingday
+"numeric", # weather
+"numeric", # temp
+"numeric", # atemp
+"numeric", # humidity
+"numeric", # windspeed
+"numeric", #registered
+"numeric" #count
+)
+set_up_features <- function(df) {
+  df$datetime <- strptime(df$datetime, format="%Y-%m-%d %H:%M:%S")
+  df$time <- df$datetime$hour + df$datetime$min/60. + df$datetime$sec/3600.
+  df$wday <- as.numeric(df$datetime$wday)
+  df$month <- as.numeric(df$datetime$mon)
+  df$year <- as.numeric(df$datetime$year - 111)
+df
+}
+
+```
+
+```{r chunk3-data.loading,cache=TRUE}
+train <- read.csv("../DATA/train.csv", colClasses=test_classes)
+test <- read.csv("../DATA/test.csv", colClasses=test_classes[1:9])
+train$count <- as.integer(train$count)
+
+train_factor <- set_up_features(train)
+test_factor <- set_up_features(test)
+
+train_factor<- train_factor[,-11]
+train_factor<- train_factor[,-10]
+train_factor<- train_factor[,-1]
+test_factor<- test_factor[,-1]
+
+temp <- train_factor[,!(colnames(train_factor) %in% 'count')]
+pp.rule <- preProcess(temp, method=c('range'))
+pp.train <- predict(pp.rule,temp)
+pp.test <- predict(pp.rule,test_factor)
+pp.train$count <- train_factor[,'count']
+pp.test$datetime <- test$datetime
+
+set.seed(1523)
+trainIndex <- createDataPartition(pp.train$count, p = 0.8, list=FALSE, times=1)
+subTrain <- pp.train[trainIndex,]
+subTest <- pp.train[-trainIndex,]
+```
+
+```{r chunk4-factorize, cache=TRUE}
+# factorize the features with few levels
+subTrain2<-subTrain
+subTest2 <- subTest
+pp.2.test <- pp.test
+ind <- c(1,2,3,4,10,11,12)
+for (i in ind) {subTrain2[,i] <- as.factor(subTrain2[,i])}
+for (i in ind) {subTest2[,i] <- as.factor(subTest2[,i])}
+for (i in ind) {pp.2.test[,i] <- as.factor(pp.2.test[,i])}
+
+```
+
+## Testing self-defined summary function with gbm
+
+  -- In addition, I will assume poisson distribution. 
+  
+```{r chunk5-gbm1,cache=TRUE,eval=FALSE}
+## gbm fitting
+set.seed(123)
+fitControl <- trainControl(method = 'cv', number = 6, summaryFunction=my2metric)
+Grid <- expand.grid( n.trees = seq(100,3000,100), interaction.depth = c(30), shrinkage = c(0.075))
+formula <- count ~ season + workingday + weather + temp + atemp + humidity + windspeed + time + wday + month + year
+fit.gbm <- train(formula, data=subTrain, method = 'gbm', trControl=fitControl, verbose=FALSE,tuneGrid=Grid,metric='RMSLE',maximize=FALSE,distribution='poisson')
+
+#show(fit.gbm)
+plot(fit.gbm)
+gbmVarImp<-varImp(fit.gbm)  
+plot(gbmVarImp)
+
+write.submission(fit.gbm, 'submission_gbm_v3.csv',pp.test)
+save(fit.gbm,file='fit_gbm.RData')
+```
+
+  -- The submission score is 0.44993 (ntree=3000, interaction=10, shrinkage=0.05, no repeats, 90% of training), no better than the ntree=250, shrinkage=0.075 result. Overfiting could be serious.
+
+  -- With 80% of training sample, (ntree=3000, interaction=10, shrinkage=0.075, repeats=3), submission score improves to 0.439. (not good enough)
+
+  -- Check the performance if some parameters are set to factor
+  
+```{r chunk6-gbm2,cache=TRUE,eval=FALSE}
+set.seed(123)
+fitControl <- trainControl(method = 'cv', number = 6, summaryFunction=my2metric)
+Grid <- expand.grid( n.trees = seq(100,3000,100), interaction.depth = c(30), shrinkage = c(0.075))
+
+formula <- count ~ season + workingday + weather + temp + atemp + humidity + windspeed + time + wday + month + year
+fit.gbm.f <- train(formula, data=subTrain2, method = 'gbm', trControl=fitControl, verbose=FALSE,tuneGrid=Grid,metric='RMSLE',maximize=FALSE,distribution='poisson')
+#show(fit.gbm.f)
+plot(fit.gbm.f)
+gbmFVarImp<-varImp(fit.gbm.f)  
+plot(gbmFVarImp)
+write.submission(fit.gbm.f, 'submission_gbm_v4.csv',pp.2.test)
+save(fit.gbm.f,file='fit_gbmf.RData')
+```
+
+  * The rmsle doesn't change much.  However, the submission score improves a lot: from ~0.43 to 0.402. 
+
+## regression only modeling
+
+#### Model2: lasso / enet
+
+```{r chunk7-enet,cache=TRUE}
+#enet in caret/elasticnet 
+#when lambda = 0 -> lasso
+set.seed(123)
+fitControl <- trainControl(method = 'cv', number = 6, summaryFunction=my2metric)
+Grid <- expand.grid( fraction = seq(0.05,1.0,0.05),lambda=seq(0,1.0,0.2))
+formula <- count ~ season + workingday + weather + temp + atemp + humidity + windspeed + time + wday + month + year
+fit.enet <- train(formula, data=subTrain, method = 'enet', trControl=fitControl,tuneGrid=Grid,metric='RMSLE', maximize=FALSE)
+#show(fit.enet)
+plot(fit.enet)
+
+enetVarImp<-varImp(fit.enet)  
+plot(enetVarImp)
+save(fit.enet,file='fit_enet.RData')
+```
+
+
+#### Model3: pcr : principle componenet analsis
+
+```{r chunk8-pcr,cache=TRUE}
+#pcr in caret/pls 
+set.seed(123)
+fitControl <- trainControl(method = 'cv', number = 6, summaryFunction=my2metric)
+Grid <- expand.grid(ncomp = seq(3,10))
+formula <- count ~ season + workingday + weather + temp + atemp + humidity + windspeed + time + wday + month + year
+fit.pcr <- train(formula, data=subTrain, method = 'pcr', trControl=fitControl,metric='RMSLE', maximize=FALSE,tuneGrid=Grid)
+#show(fit.pcr)
+plot(fit.pcr)
+pcrVarImp<-varImp(fit.pcr)  
+plot(pcrVarImp)
+save(fit.pcr,file='fit_pcr.RData')
+```
+
+#### Model4: glmnet : another elastic-net regularization for linear regression
+
+    -- could use poission distribution
+
+```{r chunk9-glmnet,cache=TRUE}
+#glmnet in caret/glmnet 
+set.seed(123)
+fitControl <- trainControl(method = 'cv', number = 6, summaryFunction=my2metric)
+Grid <- expand.grid(lambda = seq(0.1,50.0,0.5),alpha=c(1))
+formula <- count ~ season + workingday + weather + temp + atemp + humidity + windspeed + time + wday + month + year
+fit.glmnet <- train(formula, data=subTrain, method = 'glmnet', trControl=fitControl,metric='RMSLE', maximize=FALSE,tuneGrid=Grid)
+#show(fit.glmnet)
+plot(fit.glmnet)
+glmnetVarImp<-varImp(fit.glmnet)  
+plot(glmnetVarImp)
+save(fit.glmnet,file='fit_glmnet.RData')
+```
+
+  -- Interesting, temp is more important than time (if family='poisson')? this is totally different than others. But, also the result is very bad. family='poisson' doesn't help, although it fix the negative prediction problem. 
+  
+
+#### Model 4b: glmnet with second order interaction
+
+```{r chunk10-glmnet2, cache=TRUE,eval=FALSE}
+set.seed(123)
+fitControl <- trainControl(method = 'cv', number = 6, summaryFunction=my2metric)
+Grid <- expand.grid(lambda = seq(0.1,50.0,0.5),alpha=c(1))
+formula <- count ~ season + workingday + weather + temp + atemp + humidity + windspeed + time + wday + month + year + temp*time + time*atemp + time*year + temp*year + time*workingday + temp*workingday + atemp*workingday + time*time + temp*temp + atemp*atemp + workingday*workingday + atemp*atemp
+fit.glmnet.2OrderInt <- train(formula, data=subTrain, method = 'glmnet', trControl=fitControl,metric='RMSLE', maximize=FALSE,tuneGrid=Grid)
+plot(fit.glmnet.2OrderInt)
+glmnet2VarImp<-varImp(fit.glmnet.2OrderInt)  
+plot(glmnet2VarImp)
+save(fit.glmnet.2OrderInt,file='fit_glmnet2.RData')
+
+```
+
+  -- Improve a little bit, but not much. 
+
+
+## Model: random forest family
+
+#### Model5a: qrf : quantile random forest 
+
+  -- This is regression only, why? different from other random forest model
+      
+```{r chunk11-qrf,cache=TRUE,eval=TRUE}
+#qrf in caret/quantregForest 
+set.seed(123)
+fitControl <- trainControl(method = 'cv', number=6, summaryFunction=my2metric)
+Grid <- expand.grid(mtry = c(5,7,10))
+formula <- count ~ season + workingday + weather + temp + atemp + humidity + windspeed + time + wday + month + year
+fit.qrf <- train(formula, data=subTrain, method = 'qrf', trControl=fitControl,metric='RMSLE', maximize=FALSE,tuneGrid=Grid)
+#show(fit.qrf)
+plot(fit.qrf)
+qrfVarImp<-varImp(fit.qrf)  
+plot(qrfVarImp)
+write.submission(fit.qrf, 'submission_qrf_v2.csv',pp.test)
+
+set.seed(123)
+fitControl <- trainControl(method = 'cv', number=6, summaryFunction=my2metric)
+Grid <- expand.grid(mtry = c(7,10,15))
+formula <- count ~ season + workingday + weather + temp + atemp + humidity + windspeed + time + wday + month + year
+fit.qrf.f <- train(formula, data=subTrain2, method = 'qrf', trControl=fitControl,metric='RMSLE', maximize=FALSE,tuneGrid=Grid)
+#show(fit.qrf)
+plot(fit.qrf.f)
+qrffVarImp<-varImp(fit.qrf.f)  
+plot(qrffVarImp)
+write.submission(fit.qrf.f, 'submission_qrff_v3.csv',pp.2.test)
+
+save(fit.qrf,fit.qrf.f,file='fit_qrf.RData')
+
+```
+
+  -- This is good. Well, a slow random forest based model is quite promising. Submit it, and see the result.
+  
+  -- Still, the submission score is 0.448, worse than the previous rf result with score 0.426. This is slightly better than the GBM numbers though. 
+
+  -- oob doesn't work with qrf. 
+  
+  -- Try again with factorized features. 
+
+#### Model5b: rf : the simplest random forest
+      
+```{r chunk12-rf,cache=TRUE,eval=FALSE}
+#rf in caret/randomForest 
+set.seed(123)
+fitControl <- trainControl(method = 'oob')
+Grid <- expand.grid(mtry = c(15,20,25,30))
+formula <- count ~ season + workingday + weather + temp + atemp + humidity + windspeed + time + wday + month + year
+fit.rf <- train(formula, data=subTrain2, method = 'rf', trControl=fitControl,metric='RMSE', maximize=FALSE,tuneGrid=Grid)
+#show(fit.rf)
+plot(fit.rf$results$mtry,fit.rf$results$RMSE)
+write.submission(fit.rf, 'submission_rf_v3.csv',pp.2.test)
+save(fit.rf,file='fit_rf.RData')
+```
+
+  -- method=oob will significantly improve the calculation time. However, RMSLE is not recoganized. 
+  
+  -- the RMSLE seems to be quite good: 0.333 for testing subset, 0.191 for training subset.
+  
+#### Model5c: cforest : the conditional inference random forest
+      
+```{r chunk13-cforest,cache=TRUE,eval=FALSE}
+#rf in caret/randomForest 
+set.seed(123)
+fitControl <- trainControl(method = 'oob',summaryFunction=my2metric)
+Grid <- expand.grid(mtry = c(15,30,45))
+formula <- count ~ season + workingday + weather + temp + atemp + humidity + windspeed + time + wday + month + year
+fit.cforest <- train(formula, data=subTrain2, method = 'cforest', trControl=fitControl,metric='RMSLE', maximize=FALSE,tuneGrid=Grid)
+#show(fit.cforest)
+plot(fit.cforest$results$mtry,fit.cforest$results$RMSE)
+write.submission(fit.cforest, 'submission_cforest_v3.csv',pp.2.test)
+save(fit.cforest,file='fit_cforest.RData')
+```
+
+  -- method=oob will significantly reduce the calculation time compare to CV. However, I can't use self-defined metrics RMSLE. 
+  
+  -- result of rf: the RMSLE seems to be quite good: 0.333 for testing subset, 0.191 for training subset.
+
+  -- However, cforest works strangly. 1. RMSE doesn't converge with very high mtry. 2. the RMSLE of cforest is very high ~ 0.5.
+  
+  
+## Model: SVM-family
+
+#### Model6a: Radial kernal (caret/kernlab/rvmRadial)
+
+  -- SVM/RVM is too slow. I need to reduce the DoF. 
+
+  -- Linear kernal won't work, I should directly use Gaussian kernal. 
+
+  -- I will use rvm first, which use Bayseian inherence to optimize the model. Therefore, no need to use the regularization parameter C, but may be trapped at the local minimum. 
+
+```{r chunk14-rvmRadial,cache=TRUE,eval=TRUE}
+set.seed(123)
+Grid <- expand.grid(sigma = c(0.05,0.1,0.2))
+fitControl <- trainControl(method = 'cv', number = 4, summaryFunction=my2metric)
+formula <- count ~ workingday  + temp + atemp + humidity + time + wday + year
+fit.rvmRadial <- train(formula, data=subTrain, method = 'rvmRadial', trControl=fitControl,metric='RMSLE', maximize=FALSE,tuneGrid=Grid)
+#show(fit.rvmRadial)
+plot(fit.rvmRadial)
+rvmRadialVarImp<-varImp(fit.rvmRadial)  
+plot(rvmRadialVarImp)
+save(fit.rvmRadial,file='fit_rvmRadial.RData')
+
+```
+## Model: NN-family
+
+#### Model 8a: Neural network with/without PCA feature selection (caret/nnet/pcaNNet or caret/nnet/nnet)
+
+  -- tune parameter: size, decay
+
+```{r pcaNNet, cache=TRUE, echo=TRUE, eval=FALSE}
+set.seed(123)
+Grid <- expand.grid(size=seq(3,20,5),decay=c(0.01,0.1,0.2,0.3))
+fitControl <- trainControl(method = 'cv', number = 6, summaryFunction=my2metric)
+formula <- count ~ season + workingday + weather + temp + atemp + humidity + windspeed + time + wday + month + year
+fit.pcaNNet <- train(formula, data=subTrain, method = 'pcaNNet', trControl=fitControl,metric='RMSLE', maximize=FALSE,tuneGrid=Grid,linout=TRUE,maxit=5000,trace=FALSE)
+#show(fit.rvmRadial)
+plot(fit.pcaNNet)
+pcaNNetVarImp<-varImp(fit.pcaNNet)  
+plot(pcaNNetVarImp)
+
+set.seed(123)
+Grid <- expand.grid(size=seq(3,20,5),decay=c(0.01,0.1,0.2,0.3))
+fitControl <- trainControl(method = 'cv', number = 6, summaryFunction=my2metric)
+formula <- count ~ season + workingday + weather + temp + atemp + humidity + windspeed + time + wday + month + year
+fit.nnet <- train(formula, data=subTrain, method = 'nnet', trControl=fitControl,metric='RMSLE', maximize=FALSE,tuneGrid=Grid,linout=TRUE,maxit=5000,trace=FALSE)
+#show(fit.rvmRadial)
+plot(fit.nnet)
+nnetVarImp<-varImp(fit.nnet)  
+plot(nnetVarImp)
+save(fit.nnet,fit.pcaNNet,file='fit_nnet.RData')
+```
+
+  -- Note: need to set linout=TRUE for regression. Otherwise, the prediction will be set to logestic.  
+  
+  -- performance is not good with single layer. --> try other neural network models
+  
+
+#### Model 8b: Neural network with 3 layers (caret/neuralnet/neuralnet)
+
+  -- tune parameter: layer1, layer2, layer3
+
+```{r neuralnet, cache=TRUE, echo=TRUE,eval=FALSE}
+set.seed(123)
+Grid <- expand.grid(layer1=c(2,6),layer2=c(2,6),layer3=c(2,6))
+fitControl <- trainControl(method = 'cv', number=6, summaryFunction=my2metric)
+formula <- count ~ season + workingday + weather + temp + atemp + humidity + windspeed + time + wday + month + year
+fit.neuralnet <- train(formula, data=subTrain, method = 'neuralnet', trControl=fitControl,metric='RMSLE', maximize=FALSE,tuneGrid=Grid,linear.output=TRUE)
+#show(fit.rvmRadial)
+neuralnetVarImp<-varImp(fit.neuralnet)  
+plot(neuralnetVarImp)
+save(fit.neuralnet,file='fit_neuralnet.RData')
+```
+
+  -- But, there are too many possibility of parameters, and no idea how to optimize the parameters. 
+
+## Model Comparison
+
+```{r, cache=TRUE, echo=FALSE}
+load(file='fit_gbm.RData')
+load(file='fit_gbmf.RData')
+load(file='fit_enet.RData')
+load(file='fit_pcr.RData')
+load(file='fit_glmnet.RData')
+load(file='fit_glmnet2.RData')
+load(file='fit_qrf.RData')
+load(file='fit_rf.RData')
+load(file='fit_cforest.RData')
+load(file='fit_rvmRadial.RData')
+load(file='fit_nnet.RData')
+load(file='fit_neuralnet.RData')
+compare <- data.frame()
+compare<-tool.performance(fit.gbm,subTest,subTrain,'gbm.CV',compare)
+compare<-tool.performance(fit.gbm.f,subTest2,subTrain2,'gbm.CV.f',compare)
+compare<-tool.performance(fit.enet,subTest,subTrain,'enet.CV',compare)
+compare<-tool.performance(fit.pcr,subTest,subTrain,'pcr.CV',compare)
+compare<-tool.performance(fit.glmnet,subTest,subTrain,'glmnet.CV',compare)
+compare<-tool.performance(fit.glmnet.2OrderInt,subTest,subTrain,'glmnet.2OInt.CV',compare)
+compare<-tool.performance(fit.qrf,subTest,subTrain,'qrf.CV',compare)
+compare<-tool.performance(fit.qrf.f,subTest2,subTrain2,'qrf.CV.f',compare)
+compare<-tool.performance(fit.rf,subTest2,subTrain2,'rf.oob.3',compare)
+compare<-tool.performance(fit.cforest,subTest2,subTrain2,'cforest.oob',compare)
+compare<-tool.performance(fit.pcaNNet,subTest,subTrain,'pcaNNet.CV.3',compare)
+compare<-tool.performance(fit.nnet,subTest,subTrain,'nnet.CV.2',compare)
+compare<-tool.performance(fit.neuralnet,subTest,subTrain,'neuralnet',compare)
+compare<-tool.performance(fit.rvmRadial,subTest,subTrain,'rvmRadial.CV',compare)
+
+```
+```{r, cache=TRUE}
+show(compare)
+```
